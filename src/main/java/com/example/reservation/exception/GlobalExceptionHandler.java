@@ -17,9 +17,34 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse("SHOW_NOT_FOUND", ex.getMessage(), MDC.get("requestId")));
     }
 
+    @ExceptionHandler(SeatTakenException.class)
+    public ResponseEntity<ErrorResponse> handleSeatTaken(SeatTakenException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ErrorResponse("SEAT_TAKEN", ex.getMessage(), MDC.get("requestId")));
+    }
+
+    @ExceptionHandler(PerUserLimitException.class)
+    public ResponseEntity<ErrorResponse> handlePerUserLimit(PerUserLimitException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ErrorResponse("PER_USER_LIMIT_EXCEEDED", ex.getMessage(), MDC.get("requestId")));
+    }
+
+    @ExceptionHandler(IdempotencyConflictException.class)
+    public ResponseEntity<ErrorResponse> handleIdempotencyConflict(IdempotencyConflictException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ErrorResponse("IDEMPOTENCY_KEY_REUSED", ex.getMessage(), MDC.get("requestId")));
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
         return ResponseEntity.badRequest()
                 .body(new ErrorResponse("INVALID_REQUEST", "Invalid request body", MDC.get("requestId")));
+    }
+
+    @ExceptionHandler(org.springframework.web.bind.MissingRequestHeaderException.class)
+    public ResponseEntity<ErrorResponse> handleMissingHeader(
+            org.springframework.web.bind.MissingRequestHeaderException ex) {
+        return ResponseEntity.badRequest()
+                .body(new ErrorResponse("INVALID_REQUEST", ex.getMessage(), MDC.get("requestId")));
     }
 }
