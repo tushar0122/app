@@ -6,7 +6,12 @@ COPY src ./src
 RUN mvn package -DskipTests -B
 
 FROM eclipse-temurin:21-jre-alpine
+RUN addgroup -S app && adduser -S app -G app
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
+USER app
 EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "app.jar"]
+ENTRYPOINT ["java", \
+    "-XX:+UseContainerSupport", \
+    "-XX:MaxRAMPercentage=75.0", \
+    "-jar", "app.jar"]
