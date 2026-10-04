@@ -31,7 +31,7 @@ CREATE TABLE reservations (
     created_at      TIMESTAMP NOT NULL DEFAULT now(),
     cancelled_at    TIMESTAMP,
 
-    CONSTRAINT uq_idempotency UNIQUE (user_id, idempotency_key),
+    CONSTRAINT uq_idempotency UNIQUE (show_id, user_id, idempotency_key),
     CONSTRAINT chk_reservation_status CHECK (status IN ('CONFIRMED', 'CANCELLED'))
 );
 

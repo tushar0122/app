@@ -46,7 +46,7 @@ public class ReservationService {
 
         // 1. Idempotency check
         Optional<Reservation> existing = reservationRepository
-                .findByUserIdAndIdempotencyKey(userId, idempotencyKey);
+                .findByShowIdAndUserIdAndIdempotencyKey(showId, userId, idempotencyKey);
         if (existing.isPresent()) {
             return handleIdempotency(existing.get(), requestHash);
         }
@@ -67,7 +67,7 @@ public class ReservationService {
         //    Under READ COMMITTED, this now sees any reservation committed
         //    by a concurrent request that held this lock before us.
         existing = reservationRepository
-                .findByUserIdAndIdempotencyKey(userId, idempotencyKey);
+                .findByShowIdAndUserIdAndIdempotencyKey(showId, userId, idempotencyKey);
         if (existing.isPresent()) {
             return handleIdempotency(existing.get(), requestHash);
         }
@@ -98,15 +98,15 @@ public class ReservationService {
         UUID reservationId = UUID.randomUUID();
         long amountPaise = show.getPricePaise() * sortedSeats.size();
 
-        int inserted = reservationRepository.insertIfAbsent(
-                reservationId, showId, userId, amountPaise, idempotencyKey, requestHash);
-
-        if (inserted == 0) {
-            Reservation winner = reservationRepository
-                    .findByUserIdAndIdempotencyKey(userId, idempotencyKey)
-                    .orElseThrow(() -> new IllegalStateException("Idempotency conflict but no reservation found"));
-            return handleIdempotency(winner, requestHash);
-        }
+        Reservation reservation = new Reservation();
+        reservation.setId(reservationId);
+        reservation.setShowId(showId);
+        reservation.setUserId(userId);
+        reservation.setAmountPaise(amountPaise);
+        reservation.setStatus("CONFIRMED");
+        reservation.setIdempotencyKey(idempotencyKey);
+        reservation.setRequestHash(requestHash);
+        reservationRepository.save(reservation);
 
         // 9. Create reservation_seats and update seat status
         for (Seat seat : seats) {
