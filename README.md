@@ -23,7 +23,7 @@ The included `burst.sh` script fires concurrent HTTP requests against a running 
 # Start the service
 docker compose up -d
 
-# Run with defaults (500 users, 100 parallel workers)
+# Run with defaults (200 users, 50 parallel workers)
 ./burst.sh
 
 # Custom target and concurrency
@@ -31,11 +31,17 @@ docker compose up -d
 
 # Tune the blast
 HOT_SEAT_USERS=1000 PARALLEL=200 ./burst.sh
+
+# Windows CMD / PowerShell (requires Git for Windows)
+bash burst.sh
+bash burst.sh http://localhost:8080
+HOT_SEAT_USERS=500 PARALLEL=100 bash burst.sh
 ```
 
 ### Requirements
 
-- `curl`, `openssl`, `awk` (standard on Linux/macOS; on Windows use Git Bash)
+- `curl`, `openssl`, `awk` (standard on Linux/macOS)
+- **Windows:** works with [Git Bash](https://gitforwindows.org/) (bundled with Git for Windows)
 - A running instance with the matching `JWT_SECRET`
 
 ---
