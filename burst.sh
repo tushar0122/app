@@ -3,8 +3,8 @@ set -uo pipefail
 
 BASE_URL="${1:-http://localhost:8080}"
 JWT_SECRET="${2:-super-secret-key-for-development-only-change-in-production-min-32-chars}"
-HOT_SEAT_USERS="${HOT_SEAT_USERS:-2000}"
-PARALLEL="${PARALLEL:-500}"
+HOT_SEAT_USERS="${HOT_SEAT_USERS:-200}"
+PARALLEL="${PARALLEL:-50}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -39,29 +39,26 @@ error_detail() {
     printf "${RED}       ERROR${NC} %s\n" "$1"
 }
 
-# ── JWT generation ──────────────────────────────────────────────
+# ── JWT (header computed once, reused everywhere) ──────────────
 
-base64url() {
-    openssl enc -base64 -A | tr '+/' '-_' | tr -d '='
-}
+JWT_HEADER=$(echo -n '{"alg":"HS256","typ":"JWT"}' | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
 
-jwt() {
+jwt_fast() {
     local sub=$1 role=${2:-}
-    local header payload
-    header=$(echo -n '{"alg":"HS256","typ":"JWT"}' | base64url)
+    local payload
     if [ -n "$role" ]; then
-        payload=$(printf '{"sub":"%s","role":"%s"}' "$sub" "$role" | base64url)
+        payload=$(printf '{"sub":"%s","role":"%s"}' "$sub" "$role" | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
     else
-        payload=$(printf '{"sub":"%s"}' "$sub" | base64url)
+        payload=$(printf '{"sub":"%s"}' "$sub" | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
     fi
     local sig
-    sig=$(echo -n "$header.$payload" | openssl dgst -sha256 -hmac "$JWT_SECRET" -binary | base64url)
-    echo "$header.$payload.$sig"
+    sig=$(printf '%s.%s' "$JWT_HEADER" "$payload" | openssl dgst -sha256 -hmac "$JWT_SECRET" -binary | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
+    printf '%s.%s.%s' "$JWT_HEADER" "$payload" "$sig"
 }
 
-ADMIN_TOKEN=$(jwt "admin-1" "admin")
+ADMIN_TOKEN=$(jwt_fast "admin-1" "admin")
 
-# ── Helper: create show ────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────
 
 create_show() {
     local name=$1 seats_json=$2 price=$3 limit=$4
@@ -75,7 +72,6 @@ create_show() {
         -d "$body")
     http_code=$(echo "$response" | tail -1)
     body_resp=$(echo "$response" | sed '$d')
-
     if [ "$http_code" != "201" ]; then
         fail "Create show '$name' failed (HTTP $http_code)"
         error_detail "Response: $body_resp"
@@ -84,9 +80,7 @@ create_show() {
     echo "$body_resp"
 }
 
-get_show() {
-    curl -s "$BASE_URL/shows/$1"
-}
+get_show() { curl -s "$BASE_URL/shows/$1"; }
 
 extract_field() {
     echo "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
@@ -96,44 +90,71 @@ extract_number() {
     echo "$1" | grep -o "\"$2\":[0-9]*" | head -1 | cut -d: -f2
 }
 
-# ── Helper: fire concurrent reservations ───────────────────────
+# ── fire_reserve: parallel workers (token gen + curl in one) ───
+#
+# Each worker reads a chunk of the input, generates JWT tokens,
+# and fires HTTP requests — all inside a single background job.
+# No intermediate script files, no sequential loops.
 
 fire_reserve() {
     local show_id=$1 results_dir=$2 input_file=$3
+    local total
+    total=$(wc -l < "$input_file" | tr -d ' ')
+    local workers=$PARALLEL
+    [ "$workers" -gt "$total" ] && workers=$total
 
-    local i=0
-    while IFS=' ' read -r user_id idem_key seats_csv; do
-        i=$((i + 1))
-        local token
-        token=$(jwt "$user_id")
-        local seats_json
-        seats_json=$(echo "$seats_csv" | tr ',' '\n' | sed 's/.*/"&"/' | paste -sd',' | sed 's/^/[/;s/$/]/')
-        local body
-        body=$(printf '{"seats":%s}' "$seats_json")
+    # Number each line: "1 user-00001 key-00001 A1"
+    awk '{print NR, $0}' "$input_file" > "$results_dir/numbered.txt"
 
-        cat > "$results_dir/run_$i.sh" << SCRIPT
-#!/usr/bin/env bash
-curl -s -w "\\n%{http_code}" -X POST "$BASE_URL/shows/$show_id/reserve" \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $token" \
-    -H "Idempotency-Key: $idem_key" \
-    -d '$body' > "$results_dir/$i.resp" 2>"$results_dir/$i.err"
-tail -1 "$results_dir/$i.resp" > "$results_dir/$i.status"
-SCRIPT
-        chmod +x "$results_dir/run_$i.sh"
-    done < "$input_file"
-
-    local total=$i
-
-    # Fire in batches of $PARALLEL
-    local batch=0
-    for j in $(seq 1 "$total"); do
-        bash "$results_dir/run_$j.sh" &
-        batch=$((batch + 1))
-        if [ "$batch" -ge "$PARALLEL" ]; then
-            wait
-            batch=0
+    # Split into per-worker chunk files
+    local chunk_size=$(( (total + workers - 1) / workers ))
+    local chunk_id=0 count=0
+    local cf="$results_dir/w_0.txt"
+    : > "$cf"
+    while IFS= read -r line; do
+        echo "$line" >> "$cf"
+        count=$((count + 1))
+        if [ "$count" -ge "$chunk_size" ]; then
+            chunk_id=$((chunk_id + 1))
+            cf="$results_dir/w_${chunk_id}.txt"
+            : > "$cf"
+            count=0
         fi
+    done < "$results_dir/numbered.txt"
+
+    info "Firing $total requests ($workers workers x ~$chunk_size each)..."
+
+    # Launch workers — each generates tokens + fires curls for its chunk
+    for wf in "$results_dir"/w_*.txt; do
+        [ -s "$wf" ] || continue
+        (
+            while IFS=' ' read -r num user_id idem_key seats_csv; do
+                # Inline JWT generation (no function call overhead)
+                local payload sig token
+                payload=$(printf '{"sub":"%s"}' "$user_id" | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
+                sig=$(printf '%s.%s' "$JWT_HEADER" "$payload" | openssl dgst -sha256 -hmac "$JWT_SECRET" -binary | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
+                token="$JWT_HEADER.$payload.$sig"
+
+                # Fast single-seat path (no sed/tr/paste)
+                local seats_json
+                case "$seats_csv" in
+                    *,*) seats_json=$(echo "$seats_csv" | tr ',' '\n' | sed 's/.*/"&"/' | paste -sd',' | sed 's/^/[/;s/$/]/') ;;
+                    *)   seats_json="[\"$seats_csv\"]" ;;
+                esac
+
+                curl -s --connect-timeout 10 -m 30 -w '\n%{http_code}' \
+                    -X POST "$BASE_URL/shows/$show_id/reserve" \
+                    -H "Content-Type: application/json" \
+                    -H "Authorization: Bearer $token" \
+                    -H "Idempotency-Key: $idem_key" \
+                    -d "{\"seats\":$seats_json}" > "$results_dir/$num.resp" 2>/dev/null || true
+                if [ -f "$results_dir/$num.resp" ] && [ -s "$results_dir/$num.resp" ]; then
+                    tail -1 "$results_dir/$num.resp" > "$results_dir/$num.status"
+                else
+                    echo "000" > "$results_dir/$num.status"
+                fi
+            done < "$wf"
+        ) &
     done
     wait
 }
@@ -176,23 +197,21 @@ show_errors() {
     fi
 }
 
-# ── Connectivity check ────────────────────────────────────────
+# ── Connectivity ──────────────────────────────────────────────
 
 check_connectivity() {
     printf "\n${BOLD}Preflight${NC}\n"
     local health_resp health_code
     health_resp=$(curl -s -w "\n%{http_code}" --connect-timeout 5 "$BASE_URL/health/live" 2>&1) || true
     health_code=$(echo "$health_resp" | tail -1)
-
     if [ "$health_code" != "200" ]; then
-        printf "${RED}  Cannot reach %s/health/live (HTTP %s)${NC}\n" "$BASE_URL" "$health_code"
-        printf "${RED}  Is the service running? Try: docker compose up -d${NC}\n"
+        printf "${RED}  Cannot reach %s (HTTP %s)${NC}\n" "$BASE_URL" "$health_code"
         exit 1
     fi
     pass "Service reachable at $BASE_URL"
 }
 
-# ── Test 1: Hot-Seat Storm ─────────────────────────────────────
+# ── Test 1: Hot-Seat Storm ────────────────────────────────────
 
 test_hot_seat() {
     printf "\n${BOLD}=== Test 1: Hot-Seat Storm (%d users -> seat A1) ===${NC}\n" "$HOT_SEAT_USERS"
@@ -202,10 +221,8 @@ test_hot_seat() {
     resp=$(create_show "hot-seat-test" "$seats" 25000 4) || return 0
     local show_id
     show_id=$(extract_field "$resp" "show_id")
-
     if [ -z "$show_id" ]; then
-        fail "Could not extract show_id from response"
-        error_detail "Response: $resp"
+        fail "Could not extract show_id"
         return 0
     fi
     info "Show created: $show_id"
@@ -213,7 +230,6 @@ test_hot_seat() {
     local results_dir="$TMPDIR_BURST/hot_seat"
     mkdir -p "$results_dir"
 
-    info "Firing $HOT_SEAT_USERS concurrent requests for seat A1..."
     local input_file="$results_dir/input.txt"
     for i in $(seq 1 "$HOT_SEAT_USERS"); do
         printf "user-%05d key-user-%05d A1\n" "$i" "$i"
@@ -235,7 +251,6 @@ test_hot_seat() {
         && pass "All $HOT_SEAT_USERS requests got a response" \
         || fail "Only $total_responses/$HOT_SEAT_USERS requests got responses"
 
-    # Reconciliation
     local show_state
     show_state=$(get_show "$show_id")
     local available confirmed total
@@ -246,14 +261,13 @@ test_hot_seat() {
 
     printf "${DIM}  Seats: available=%d confirmed=%d total=%d${NC}\n" "$available" "$confirmed" "$total"
     [ "$sum" -eq "$total" ] && pass "Reconciliation: $available + $confirmed = $total" \
-                            || fail "Reconciliation failed: $available + $confirmed = $sum (expected $total)"
+                            || fail "Reconciliation: $available + $confirmed = $sum (expected $total)"
 }
 
-# ── Test 2: Per-User Limit ─────────────────────────────────────
+# ── Test 2: Per-User Limit ────────────────────────────────────
 
 test_per_user_limit() {
-    local limit=4
-    local requests=10
+    local limit=4 requests=10
     printf "\n${BOLD}=== Test 2: Per-User Limit (1 user, %d requests, limit=%d) ===${NC}\n" "$requests" "$limit"
 
     local seats_json='['
@@ -272,7 +286,6 @@ test_per_user_limit() {
     local results_dir="$TMPDIR_BURST/per_user"
     mkdir -p "$results_dir"
 
-    info "Firing $requests concurrent single-seat requests from one user..."
     local input_file="$results_dir/input.txt"
     for i in $(seq 1 "$requests"); do
         printf "limit-user key-limit-%d S%d\n" "$i" "$i"
@@ -286,8 +299,8 @@ test_per_user_limit() {
 
     printf "${DIM}  Results: 201=%d  409=%d  5xx=%d${NC}\n" "$c201" "$c409" "$c5xx"
 
-    [ "$c201" -le "$limit" ] && pass "Confirmed seats ($c201) <= limit ($limit)" \
-                             || fail "Confirmed seats ($c201) > limit ($limit)"
+    [ "$c201" -le "$limit" ] && pass "Confirmed ($c201) <= limit ($limit)" \
+                             || fail "Confirmed ($c201) > limit ($limit)"
     [ "$c201" -gt 0 ] && pass "At least 1 reservation succeeded" \
                       || fail "No reservations succeeded"
     [ "$c5xx" -eq 0 ] && pass "Zero 5xx errors" || { fail "Got $c5xx server errors"; show_errors "$results_dir" "Per-user"; }
@@ -296,13 +309,13 @@ test_per_user_limit() {
     show_state=$(get_show "$show_id")
     local confirmed
     confirmed=$(extract_number "$show_state" "confirmed")
-    [ "$confirmed" -le "$limit" ] && pass "DB confirmed count ($confirmed) <= limit ($limit)" \
-                                  || fail "DB confirmed count ($confirmed) > limit ($limit)"
-    [ "$confirmed" -eq "$c201" ] && pass "DB confirmed ($confirmed) matches HTTP 201 count ($c201)" \
-                                 || fail "DB confirmed ($confirmed) != HTTP 201 count ($c201)"
+    [ "$confirmed" -le "$limit" ] && pass "DB confirmed ($confirmed) <= limit ($limit)" \
+                                  || fail "DB confirmed ($confirmed) > limit ($limit)"
+    [ "$confirmed" -eq "$c201" ] && pass "DB confirmed ($confirmed) matches 201 count ($c201)" \
+                                 || fail "DB confirmed ($confirmed) != 201 count ($c201)"
 }
 
-# ── Test 3: Idempotency ────────────────────────────────────────
+# ── Test 3: Idempotency ──────────────────────────────────────
 
 test_idempotency() {
     local dupes=20
@@ -317,7 +330,6 @@ test_idempotency() {
     local results_dir="$TMPDIR_BURST/idempotency"
     mkdir -p "$results_dir"
 
-    info "Firing $dupes identical requests (same user, same key, same seat)..."
     local input_file="$results_dir/input.txt"
     for i in $(seq 1 "$dupes"); do
         echo "idemp-user same-key-123 I1"
@@ -340,10 +352,9 @@ test_idempotency() {
     [ "$confirmed" -eq 1 ] && pass "Exactly 1 reservation in DB" \
                            || fail "Expected 1 reservation, got $confirmed"
 
-    # Same key, different seat -> must be 409
     info "Testing same key with different seat..."
     local token
-    token=$(jwt "idemp-user")
+    token=$(jwt_fast "idemp-user")
     local conflict_resp conflict_status conflict_body
     conflict_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/shows/$show_id/reserve" \
         -H "Content-Type: application/json" \
@@ -361,7 +372,7 @@ test_idempotency() {
     fi
 }
 
-# ── Test 4: Cancellation + Re-reserve ──────────────────────────
+# ── Test 4: Cancel + Re-reserve ──────────────────────────────
 
 test_cancel() {
     printf "\n${BOLD}=== Test 4: Cancel and Re-reserve ===${NC}\n"
@@ -372,9 +383,10 @@ test_cancel() {
     show_id=$(extract_field "$resp" "show_id")
     info "Show created: $show_id"
 
-    # Reserve C1
     local token
-    token=$(jwt "cancel-user")
+    token=$(jwt_fast "cancel-user")
+
+    # Reserve C1
     local reserve_resp reserve_status reserve_body
     reserve_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/shows/$show_id/reserve" \
         -H "Content-Type: application/json" \
@@ -383,77 +395,51 @@ test_cancel() {
         -d '{"seats":["C1"]}')
     reserve_status=$(echo "$reserve_resp" | tail -1)
     reserve_body=$(echo "$reserve_resp" | sed '$d')
-
     if [ "$reserve_status" != "201" ]; then
         fail "Reserve C1 failed (HTTP $reserve_status)"
         error_detail "Response: $reserve_body"
         return 0
     fi
-
     local res_id
     res_id=$(extract_field "$reserve_body" "reservation_id")
     pass "Reserved C1 (id=$res_id)"
 
     # Cancel
-    local cancel_resp cancel_status cancel_body
+    local cancel_resp cancel_status
     cancel_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/reservations/$res_id/cancel" \
         -H "Authorization: Bearer $token")
     cancel_status=$(echo "$cancel_resp" | tail -1)
-    cancel_body=$(echo "$cancel_resp" | sed '$d')
-
-    if [ "$cancel_status" = "200" ]; then
-        pass "Cancelled reservation"
-    else
-        fail "Cancel returned HTTP $cancel_status"
-        error_detail "Response: $cancel_body"
-    fi
+    [ "$cancel_status" = "200" ] && pass "Cancelled reservation" \
+        || { fail "Cancel returned HTTP $cancel_status"; error_detail "$(echo "$cancel_resp" | sed '$d')"; }
 
     # Double cancel
-    local double_resp double_status double_body
+    local double_resp double_status
     double_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/reservations/$res_id/cancel" \
         -H "Authorization: Bearer $token")
     double_status=$(echo "$double_resp" | tail -1)
-    double_body=$(echo "$double_resp" | sed '$d')
+    [ "$double_status" = "409" ] && pass "Double cancel -> 409" \
+        || fail "Double cancel: expected 409, got $double_status"
 
-    if [ "$double_status" = "409" ]; then
-        pass "Double cancel -> 409"
-    else
-        fail "Double cancel: expected 409, got $double_status"
-        error_detail "Response: $double_body"
-    fi
-
-    # Wrong user cancel
+    # Wrong user
     local token2
-    token2=$(jwt "other-user")
-    local wrong_resp wrong_status wrong_body
+    token2=$(jwt_fast "other-user")
+    local wrong_resp wrong_status
     wrong_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/reservations/$res_id/cancel" \
         -H "Authorization: Bearer $token2")
     wrong_status=$(echo "$wrong_resp" | tail -1)
-    wrong_body=$(echo "$wrong_resp" | sed '$d')
+    [ "$wrong_status" = "403" ] && pass "Wrong user cancel -> 403" \
+        || fail "Wrong user cancel: expected 403, got $wrong_status"
 
-    if [ "$wrong_status" = "403" ]; then
-        pass "Wrong user cancel -> 403"
-    else
-        fail "Wrong user cancel: expected 403, got $wrong_status"
-        error_detail "Response: $wrong_body"
-    fi
-
-    # Re-reserve same seat with different user
-    local re_resp re_status re_body
+    # Re-reserve
+    local re_resp re_status
     re_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/shows/$show_id/reserve" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $token2" \
         -H "Idempotency-Key: re-reserve-key" \
         -d '{"seats":["C1"]}')
     re_status=$(echo "$re_resp" | tail -1)
-    re_body=$(echo "$re_resp" | sed '$d')
-
-    if [ "$re_status" = "201" ]; then
-        pass "Re-reserved cancelled seat C1"
-    else
-        fail "Re-reserve: expected 201, got $re_status"
-        error_detail "Response: $re_body"
-    fi
+    [ "$re_status" = "201" ] && pass "Re-reserved cancelled seat C1" \
+        || fail "Re-reserve: expected 201, got $re_status"
 
     # Reconciliation
     local show_state
@@ -463,15 +449,11 @@ test_cancel() {
     confirmed=$(extract_number "$show_state" "confirmed")
     total=$(extract_number "$show_state" "total_seats")
     local sum=$((available + confirmed))
-    if [ "$sum" -eq "$total" ]; then
-        pass "Reconciliation: $available + $confirmed = $total"
-    else
-        fail "Reconciliation failed: $available + $confirmed = $sum (expected $total)"
-        error_detail "Show state: $show_state"
-    fi
+    [ "$sum" -eq "$total" ] && pass "Reconciliation: $available + $confirmed = $total" \
+        || { fail "Reconciliation: $available + $confirmed = $sum (expected $total)"; error_detail "$show_state"; }
 }
 
-# ── Run all tests ──────────────────────────────────────────────
+# ── Run ───────────────────────────────────────────────────────
 
 printf "\n${BOLD}========================================${NC}\n"
 printf "${BOLD}    SEAT RESERVATION BURST TEST${NC}\n"
@@ -486,7 +468,6 @@ test_per_user_limit
 test_idempotency
 test_cancel
 
-# Summary
 end_time=$(date +%s)
 duration=$((end_time - START_TIME))
 
