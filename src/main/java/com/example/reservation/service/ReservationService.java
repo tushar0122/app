@@ -11,7 +11,6 @@ import com.example.reservation.exception.ShowNotFoundException;
 import com.example.reservation.repository.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -89,29 +88,26 @@ public class ReservationService {
             }
         }
 
-        // 6. Create reservation
-        Reservation reservation = new Reservation();
-        reservation.setShowId(showId);
-        reservation.setUserId(userId);
-        reservation.setAmountPaise(show.getPricePaise() * sortedSeats.size());
-        reservation.setIdempotencyKey(idempotencyKey);
-        reservation.setRequestHash(requestHash);
+        // 6. All checks passed — insert reservation.
+        //    ON CONFLICT DO NOTHING on (user_id, idempotency_key):
+        //    returns 1 if inserted, 0 if key already exists.
+        UUID reservationId = UUID.randomUUID();
+        long amountPaise = show.getPricePaise() * sortedSeats.size();
 
-        try {
-            reservationRepository.save(reservation);
-            reservationRepository.flush();
-        } catch (DataIntegrityViolationException e) {
-            // Concurrent request with same idempotency key won the race
+        int inserted = reservationRepository.insertIfAbsent(
+                reservationId, showId, userId, amountPaise, idempotencyKey, requestHash);
+
+        if (inserted == 0) {
             Reservation winner = reservationRepository
                     .findByUserIdAndIdempotencyKey(userId, idempotencyKey)
-                    .orElseThrow(() -> e);
+                    .orElseThrow(() -> new IllegalStateException("Idempotency conflict but no reservation found"));
             return handleIdempotency(winner, requestHash);
         }
 
         // 7. Create reservation_seats and update seat status
         for (Seat seat : seats) {
             ReservationSeat rs = new ReservationSeat();
-            rs.setReservationId(reservation.getId());
+            rs.setReservationId(reservationId);
             rs.setSeatId(seat.getId());
             reservationSeatRepository.save(rs);
 
@@ -124,9 +120,10 @@ public class ReservationService {
         showUserRepository.save(showUser);
 
         log.info("Reservation confirmed id={} show={} user={} seats={}",
-                reservation.getId(), showId, userId, sortedSeats);
+                reservationId, showId, userId, sortedSeats);
 
-        return toResponse(reservation, sortedSeats);
+        return new ReservationResponse(
+                reservationId, showId, userId, sortedSeats, amountPaise, "CONFIRMED");
     }
 
     private ReservationResponse handleIdempotency(Reservation existing, String requestHash) {
