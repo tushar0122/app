@@ -10,7 +10,7 @@ spring:
     hikari:
       maximum-pool-size: ${HIKARI_MAX_POOL:50}
       minimum-idle: ${HIKARI_MIN_IDLE:10}
-      connection-timeout: 10000
+      connection-timeout: 60000
       max-lifetime: 600000
 
   jpa:
@@ -28,6 +28,9 @@ spring:
 server:
   port: ${PORT:8080}
   forward-headers-strategy: framework
+  tomcat:
+    connection-timeout: 60s
+    keep-alive-timeout: 65s
 
 management:
   endpoints:
