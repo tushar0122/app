@@ -35,7 +35,7 @@ HOT_SEAT_USERS=1000 PARALLEL=200 ./burst.sh
 
 ### Requirements
 
-- `curl`, `openssl`, `xargs` (standard on Linux/macOS)
+- `curl`, `openssl`, `awk` (standard on Linux/macOS; on Windows use Git Bash)
 - A running instance with the matching `JWT_SECRET`
 
 ---
@@ -103,8 +103,86 @@ Interactive docs available at `/swagger-ui/index.html` when the service is runni
 Requests carry a JWT in the `Authorization: Bearer <token>` header. The token is HMAC-SHA256 signed with the configured `JWT_SECRET`.
 
 Claims:
-- `sub` — user ID
-- `role` — set to `admin` for show creation
+- `sub` — user ID (any string)
+- `role` — set to `admin` for show creation (omit for regular users)
+
+#### Generating a JWT token
+
+Tokens are signed with the `JWT_SECRET` env var. For local development with the default secret, you can generate tokens using bash + openssl:
+
+```bash
+# Helper function
+jwt() {
+  local secret="super-secret-key-for-development-only-change-in-production-min-32-chars"
+  local header=$(echo -n '{"alg":"HS256","typ":"JWT"}' | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
+  local payload=$(echo -n "$1" | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
+  local sig=$(echo -n "$header.$payload" | openssl dgst -sha256 -hmac "$secret" -binary | openssl enc -base64 -A | tr '+/' '-_' | tr -d '=')
+  echo "$header.$payload.$sig"
+}
+
+# Admin token (can create shows)
+jwt '{"sub":"admin-1","role":"admin"}'
+
+# Regular user token (can reserve/cancel)
+jwt '{"sub":"user-1"}'
+```
+
+Or use any JWT library — the token just needs `{"alg":"HS256"}` header, a `sub` claim, and HMAC-SHA256 signature with the secret.
+
+#### Pre-generated dev tokens
+
+These tokens work with the default dev secret (do not use in production):
+
+| Role | Token |
+|------|-------|
+| Admin | `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbi0xIiwicm9sZSI6ImFkbWluIn0.h_ltaIcmJXgQmvvCjCf5T1i0KsDSo0ohmNfzGHhmFGs` |
+| User-1 | `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEifQ.P1kjROjO4vn9zD1ypnXeHbypB4u5V32o7FC-okoEG0Y` |
+| User-2 | `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTIifQ.28JMVMkE4mg-oight7aPui_2Os-RGZGj7oWP8N-hX0Y` |
+
+### Testing the API
+
+After starting the service (`docker compose up -d`), test the full flow:
+
+```bash
+# Variables (use pre-generated tokens above or generate your own)
+BASE=http://localhost:8080
+ADMIN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbi0xIiwicm9sZSI6ImFkbWluIn0.h_ltaIcmJXgQmvvCjCf5T1i0KsDSo0ohmNfzGHhmFGs
+USER1=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEifQ.P1kjROjO4vn9zD1ypnXeHbypB4u5V32o7FC-okoEG0Y
+
+# 1. Health check
+curl $BASE/health/ready
+
+# 2. Create a show (admin only)
+curl -X POST $BASE/shows \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN" \
+  -d '{"name":"Avengers","seats":["A1","A2","A3","B1","B2"],"price_paise":50000,"per_user_limit":2}'
+
+# 3. View show details (public, no auth needed)
+curl $BASE/shows/<show_id>
+
+# 4. Reserve seats
+curl -X POST $BASE/shows/<show_id>/reserve \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $USER1" \
+  -H "Idempotency-Key: my-unique-key-1" \
+  -d '{"seats":["A1","A2"]}'
+
+# 5. Cancel a reservation
+curl -X POST $BASE/reservations/<reservation_id>/cancel \
+  -H "Authorization: Bearer $USER1"
+```
+
+Replace `<show_id>` and `<reservation_id>` with values from the responses.
+
+**PowerShell / CMD users:** Use Git Bash to run the above, or replace single quotes with double quotes and escape inner quotes:
+
+```powershell
+curl -X POST http://localhost:8080/shows `
+  -H "Content-Type: application/json" `
+  -H "Authorization: Bearer $ADMIN" `
+  -d "{\"name\":\"Avengers\",\"seats\":[\"A1\",\"A2\"],\"price_paise\":50000,\"per_user_limit\":2}"
+```
 
 ### Reserve Request
 
