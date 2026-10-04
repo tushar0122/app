@@ -20,11 +20,11 @@ services:
     ports:
       - "8080:8080"
     environment:
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_NAME: reservation
-      DB_USER: reservation
-      DB_PASSWORD: reservation
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: reservation
+      PGUSER: reservation
+      PGPASSWORD: reservation
       JWT_SECRET: ${JWT_SECRET:-super-secret-key-for-development-only-change-in-production-min-32-chars}
     depends_on:
       db:

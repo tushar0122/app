@@ -1,8 +1,8 @@
 spring:
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:reservation}
-    username: ${DB_USER:reservation}
-    password: ${DB_PASSWORD:reservation}
+    url: jdbc:postgresql://${PGHOST}:${PGPORT}/${PGDATABASE:reservation}
+    username: ${PGUSER:reservation}
+    password: ${PGPASSWORD:reservation}
     hikari:
       maximum-pool-size: 20
       minimum-idle: 5
