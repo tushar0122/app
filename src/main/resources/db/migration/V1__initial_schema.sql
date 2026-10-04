@@ -35,8 +35,6 @@ CREATE TABLE reservations (
     CONSTRAINT chk_reservation_status CHECK (status IN ('CONFIRMED', 'CANCELLED'))
 );
 
-CREATE INDEX idx_reservations_show_user ON reservations(show_id, user_id);
-
 CREATE TABLE reservation_seats (
     reservation_id  UUID NOT NULL REFERENCES reservations(id),
     seat_id         BIGINT NOT NULL REFERENCES seats(id),
