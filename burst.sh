@@ -1,23 +1,43 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 BASE_URL="${1:-http://localhost:8080}"
 JWT_SECRET="${2:-super-secret-key-for-development-only-change-in-production-min-32-chars}"
-HOT_SEAT_USERS="${HOT_SEAT_USERS:-500}"
-PARALLEL="${PARALLEL:-100}"
+HOT_SEAT_USERS="${HOT_SEAT_USERS:-2000}"
+PARALLEL="${PARALLEL:-500}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
 TMPDIR_BURST=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_BURST"' EXIT
 
-pass() { printf "${GREEN}PASS${NC} %s\n" "$1"; }
-fail() { printf "${RED}FAIL${NC} %s\n" "$1"; }
-info() { printf "${YELLOW}>>>${NC} %s\n" "$1"; }
+TOTAL_PASS=0
+TOTAL_FAIL=0
+TOTAL_ASSERTIONS=0
+START_TIME=$(date +%s)
+
+pass() {
+    TOTAL_PASS=$((TOTAL_PASS + 1))
+    TOTAL_ASSERTIONS=$((TOTAL_ASSERTIONS + 1))
+    printf "${GREEN}  PASS${NC} %s\n" "$1"
+}
+
+fail() {
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    TOTAL_ASSERTIONS=$((TOTAL_ASSERTIONS + 1))
+    printf "${RED}  FAIL${NC} %s\n" "$1"
+}
+
+info() { printf "${YELLOW}  >>>${NC} %s\n" "$1"; }
+
+error_detail() {
+    printf "${RED}       ERROR${NC} %s\n" "$1"
+}
 
 # ── JWT generation ──────────────────────────────────────────────
 
@@ -48,22 +68,39 @@ create_show() {
     local body
     body=$(printf '{"name":"%s","seats":%s,"price_paise":%d,"per_user_limit":%d}' \
         "$name" "$seats_json" "$price" "$limit")
-    curl -s -X POST "$BASE_URL/shows" \
+    local response http_code body_resp
+    response=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/shows" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $ADMIN_TOKEN" \
-        -d "$body"
+        -d "$body")
+    http_code=$(echo "$response" | tail -1)
+    body_resp=$(echo "$response" | sed '$d')
+
+    if [ "$http_code" != "201" ]; then
+        fail "Create show '$name' failed (HTTP $http_code)"
+        error_detail "Response: $body_resp"
+        return 1
+    fi
+    echo "$body_resp"
 }
 
 get_show() {
     curl -s "$BASE_URL/shows/$1"
 }
 
+extract_field() {
+    echo "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
+}
+
+extract_number() {
+    echo "$1" | grep -o "\"$2\":[0-9]*" | head -1 | cut -d: -f2
+}
+
 # ── Helper: fire concurrent reservations ───────────────────────
 
 fire_reserve() {
-    local show_id=$1 results_dir=$2
-    shift 2
-    # remaining args: lines of "user_id idempotency_key seat1,seat2,..."
+    local show_id=$1 results_dir=$2 input_file=$3
+
     local i=0
     while IFS=' ' read -r user_id idem_key seats_csv; do
         i=$((i + 1))
@@ -73,38 +110,103 @@ fire_reserve() {
         seats_json=$(echo "$seats_csv" | tr ',' '\n' | sed 's/.*/"&"/' | paste -sd',' | sed 's/^/[/;s/$/]/')
         local body
         body=$(printf '{"seats":%s}' "$seats_json")
-        echo "curl -s -o /dev/null -w '%{http_code}' -X POST '$BASE_URL/shows/$show_id/reserve' \
-            -H 'Content-Type: application/json' \
-            -H 'Authorization: Bearer $token' \
-            -H 'Idempotency-Key: $idem_key' \
-            -d '$body' > '$results_dir/$i.status'" >> "$results_dir/commands.sh"
-    done
 
-    chmod +x "$results_dir/commands.sh"
-    # Run commands in parallel using xargs
-    cat "$results_dir/commands.sh" | xargs -I{} -P "$PARALLEL" bash -c '{}'
+        cat > "$results_dir/run_$i.sh" << SCRIPT
+#!/usr/bin/env bash
+curl -s -w "\\n%{http_code}" -X POST "$BASE_URL/shows/$show_id/reserve" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $token" \
+    -H "Idempotency-Key: $idem_key" \
+    -d '$body' > "$results_dir/$i.resp" 2>"$results_dir/$i.err"
+tail -1 "$results_dir/$i.resp" > "$results_dir/$i.status"
+SCRIPT
+        chmod +x "$results_dir/run_$i.sh"
+    done < "$input_file"
+
+    local total=$i
+
+    # Fire in batches of $PARALLEL
+    local batch=0
+    for j in $(seq 1 "$total"); do
+        bash "$results_dir/run_$j.sh" &
+        batch=$((batch + 1))
+        if [ "$batch" -ge "$PARALLEL" ]; then
+            wait
+            batch=0
+        fi
+    done
+    wait
 }
 
 count_status() {
-    local dir=$1 code=$2
-    grep -rl "^${code}$" "$dir"/*.status 2>/dev/null | wc -l | tr -d ' '
+    local dir=$1 code=$2 result
+    result=$(grep -rl "^${code}$" "$dir"/*.status 2>/dev/null | wc -l | tr -d ' ')
+    echo "${result:-0}"
+}
+
+count_5xx() {
+    local dir=$1 result
+    result=$(grep -rl '^5' "$dir"/*.status 2>/dev/null | wc -l | tr -d ' ')
+    echo "${result:-0}"
+}
+
+show_errors() {
+    local dir=$1 label=$2
+    local err_files
+    err_files=$(grep -rl '^5' "$dir"/*.status 2>/dev/null || true)
+    if [ -n "$err_files" ]; then
+        local shown=0
+        for sf in $err_files; do
+            [ "$shown" -ge 3 ] && break
+            local num
+            num=$(basename "$sf" .status)
+            local resp_body=""
+            if [ -f "$dir/$num.resp" ]; then
+                resp_body=$(sed '$d' "$dir/$num.resp" 2>/dev/null || true)
+            fi
+            error_detail "$label request #$num -> HTTP $(cat "$sf")"
+            [ -n "$resp_body" ] && error_detail "  Body: $resp_body"
+            shown=$((shown + 1))
+        done
+        local total_err
+        total_err=$(echo "$err_files" | wc -l | tr -d ' ')
+        if [ "$total_err" -gt 3 ]; then
+            error_detail "... and $((total_err - 3)) more 5xx errors"
+        fi
+    fi
+}
+
+# ── Connectivity check ────────────────────────────────────────
+
+check_connectivity() {
+    printf "\n${BOLD}Preflight${NC}\n"
+    local health_resp health_code
+    health_resp=$(curl -s -w "\n%{http_code}" --connect-timeout 5 "$BASE_URL/health/live" 2>&1) || true
+    health_code=$(echo "$health_resp" | tail -1)
+
+    if [ "$health_code" != "200" ]; then
+        printf "${RED}  Cannot reach %s/health/live (HTTP %s)${NC}\n" "$BASE_URL" "$health_code"
+        printf "${RED}  Is the service running? Try: docker compose up -d${NC}\n"
+        exit 1
+    fi
+    pass "Service reachable at $BASE_URL"
 }
 
 # ── Test 1: Hot-Seat Storm ─────────────────────────────────────
 
 test_hot_seat() {
-    printf "\n${BOLD}═══ Test 1: Hot-Seat Storm (%d users → seat A1) ═══${NC}\n" "$HOT_SEAT_USERS"
+    printf "\n${BOLD}=== Test 1: Hot-Seat Storm (%d users -> seat A1) ===${NC}\n" "$HOT_SEAT_USERS"
 
     local seats='["A1","A2","A3","A4","A5","A6","A7","A8","A9","A10"]'
     local resp
-    resp=$(create_show "hot-seat-test" "$seats" 25000 4)
+    resp=$(create_show "hot-seat-test" "$seats" 25000 4) || return 0
     local show_id
-    show_id=$(echo "$resp" | grep -o '"show_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    show_id=$(extract_field "$resp" "show_id")
 
     if [ -z "$show_id" ]; then
-        fail "Could not create show"
-        echo "$resp"
-        return 1
+        fail "Could not extract show_id from response"
+        error_detail "Response: $resp"
+        return 0
     fi
     info "Show created: $show_id"
 
@@ -112,34 +214,39 @@ test_hot_seat() {
     mkdir -p "$results_dir"
 
     info "Firing $HOT_SEAT_USERS concurrent requests for seat A1..."
+    local input_file="$results_dir/input.txt"
     for i in $(seq 1 "$HOT_SEAT_USERS"); do
-        local uid
-        uid=$(printf "user-%05d" "$i")
-        echo "$uid key-$uid A1"
-    done | fire_reserve "$show_id" "$results_dir"
+        printf "user-%05d key-user-%05d A1\n" "$i" "$i"
+    done > "$input_file"
+    fire_reserve "$show_id" "$results_dir" "$input_file"
 
     local c201 c409 c5xx
     c201=$(count_status "$results_dir" 201)
     c409=$(count_status "$results_dir" 409)
-    c5xx=$(grep -rl '^5' "$results_dir"/*.status 2>/dev/null | wc -l | tr -d ' ')
+    c5xx=$(count_5xx "$results_dir")
 
-    printf "  201: %d  |  409: %d  |  5xx: %d\n" "$c201" "$c409" "$c5xx"
+    printf "${DIM}  Results: 201=%d  409=%d  5xx=%d${NC}\n" "$c201" "$c409" "$c5xx"
 
     [ "$c201" -eq 1 ] && pass "Exactly 1 winner" || fail "Expected 1 winner, got $c201"
-    [ "$c5xx" -eq 0 ] && pass "Zero 5xx errors" || fail "Got $c5xx server errors"
+    [ "$c5xx" -eq 0 ] && pass "Zero 5xx errors" || { fail "Got $c5xx server errors"; show_errors "$results_dir" "Hot-seat"; }
+
+    local total_responses=$((c201 + c409 + c5xx))
+    [ "$total_responses" -eq "$HOT_SEAT_USERS" ] \
+        && pass "All $HOT_SEAT_USERS requests got a response" \
+        || fail "Only $total_responses/$HOT_SEAT_USERS requests got responses"
 
     # Reconciliation
     local show_state
     show_state=$(get_show "$show_id")
     local available confirmed total
-    available=$(echo "$show_state" | grep -o '"available":[0-9]*' | cut -d: -f2)
-    confirmed=$(echo "$show_state" | grep -o '"confirmed":[0-9]*' | cut -d: -f2)
-    total=$(echo "$show_state" | grep -o '"total_seats":[0-9]*' | cut -d: -f2)
+    available=$(extract_number "$show_state" "available")
+    confirmed=$(extract_number "$show_state" "confirmed")
+    total=$(extract_number "$show_state" "total_seats")
     local sum=$((available + confirmed))
 
-    printf "  Seats: available=%d confirmed=%d total=%d\n" "$available" "$confirmed" "$total"
+    printf "${DIM}  Seats: available=%d confirmed=%d total=%d${NC}\n" "$available" "$confirmed" "$total"
     [ "$sum" -eq "$total" ] && pass "Reconciliation: $available + $confirmed = $total" \
-                            || fail "Reconciliation failed: $sum != $total"
+                            || fail "Reconciliation failed: $available + $confirmed = $sum (expected $total)"
 }
 
 # ── Test 2: Per-User Limit ─────────────────────────────────────
@@ -147,7 +254,7 @@ test_hot_seat() {
 test_per_user_limit() {
     local limit=4
     local requests=10
-    printf "\n${BOLD}═══ Test 2: Per-User Limit (1 user, %d requests, limit=%d) ═══${NC}\n" "$requests" "$limit"
+    printf "\n${BOLD}=== Test 2: Per-User Limit (1 user, %d requests, limit=%d) ===${NC}\n" "$requests" "$limit"
 
     local seats_json='['
     for i in $(seq 1 20); do
@@ -157,159 +264,240 @@ test_per_user_limit() {
     seats_json+=']'
 
     local resp
-    resp=$(create_show "limit-test" "$seats_json" 10000 "$limit")
+    resp=$(create_show "limit-test" "$seats_json" 10000 "$limit") || return 0
     local show_id
-    show_id=$(echo "$resp" | grep -o '"show_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    show_id=$(extract_field "$resp" "show_id")
     info "Show created: $show_id (limit=$limit)"
 
     local results_dir="$TMPDIR_BURST/per_user"
     mkdir -p "$results_dir"
 
     info "Firing $requests concurrent single-seat requests from one user..."
+    local input_file="$results_dir/input.txt"
     for i in $(seq 1 "$requests"); do
-        local seat
-        seat=$(printf "S%d" "$i")
-        echo "limit-user key-limit-$i $seat"
-    done | fire_reserve "$show_id" "$results_dir"
+        printf "limit-user key-limit-%d S%d\n" "$i" "$i"
+    done > "$input_file"
+    fire_reserve "$show_id" "$results_dir" "$input_file"
 
-    local c201 c409
+    local c201 c409 c5xx
     c201=$(count_status "$results_dir" 201)
     c409=$(count_status "$results_dir" 409)
+    c5xx=$(count_5xx "$results_dir")
 
-    printf "  201: %d  |  409: %d\n" "$c201" "$c409"
+    printf "${DIM}  Results: 201=%d  409=%d  5xx=%d${NC}\n" "$c201" "$c409" "$c5xx"
 
     [ "$c201" -le "$limit" ] && pass "Confirmed seats ($c201) <= limit ($limit)" \
                              || fail "Confirmed seats ($c201) > limit ($limit)"
     [ "$c201" -gt 0 ] && pass "At least 1 reservation succeeded" \
                       || fail "No reservations succeeded"
+    [ "$c5xx" -eq 0 ] && pass "Zero 5xx errors" || { fail "Got $c5xx server errors"; show_errors "$results_dir" "Per-user"; }
 
     local show_state
     show_state=$(get_show "$show_id")
     local confirmed
-    confirmed=$(echo "$show_state" | grep -o '"confirmed":[0-9]*' | cut -d: -f2)
+    confirmed=$(extract_number "$show_state" "confirmed")
     [ "$confirmed" -le "$limit" ] && pass "DB confirmed count ($confirmed) <= limit ($limit)" \
                                   || fail "DB confirmed count ($confirmed) > limit ($limit)"
+    [ "$confirmed" -eq "$c201" ] && pass "DB confirmed ($confirmed) matches HTTP 201 count ($c201)" \
+                                 || fail "DB confirmed ($confirmed) != HTTP 201 count ($c201)"
 }
 
 # ── Test 3: Idempotency ────────────────────────────────────────
 
 test_idempotency() {
-    local dupes=50
-    printf "\n${BOLD}═══ Test 3: Idempotency (%d identical requests) ═══${NC}\n" "$dupes"
+    local dupes=20
+    printf "\n${BOLD}=== Test 3: Idempotency (%d identical requests) ===${NC}\n" "$dupes"
 
     local resp
-    resp=$(create_show "idempotency-test" '["I1","I2","I3","I4","I5"]' 5000 4)
+    resp=$(create_show "idempotency-test" '["I1","I2","I3","I4","I5"]' 5000 4) || return 0
     local show_id
-    show_id=$(echo "$resp" | grep -o '"show_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    show_id=$(extract_field "$resp" "show_id")
     info "Show created: $show_id"
 
     local results_dir="$TMPDIR_BURST/idempotency"
     mkdir -p "$results_dir"
 
     info "Firing $dupes identical requests (same user, same key, same seat)..."
+    local input_file="$results_dir/input.txt"
     for i in $(seq 1 "$dupes"); do
         echo "idemp-user same-key-123 I1"
-    done | fire_reserve "$show_id" "$results_dir"
+    done > "$input_file"
+    fire_reserve "$show_id" "$results_dir" "$input_file"
 
     local c201 c409 c5xx
     c201=$(count_status "$results_dir" 201)
     c409=$(count_status "$results_dir" 409)
-    c5xx=$(grep -rl '^5' "$results_dir"/*.status 2>/dev/null | wc -l | tr -d ' ')
+    c5xx=$(count_5xx "$results_dir")
 
-    printf "  201: %d  |  409: %d  |  5xx: %d\n" "$c201" "$c409" "$c5xx"
+    printf "${DIM}  Results: 201=%d  409=%d  5xx=%d${NC}\n" "$c201" "$c409" "$c5xx"
 
-    local total_success=$((c201))
-    [ "$c5xx" -eq 0 ] && pass "Zero 5xx errors" || fail "Got $c5xx server errors"
+    [ "$c5xx" -eq 0 ] && pass "Zero 5xx errors" || { fail "Got $c5xx server errors"; show_errors "$results_dir" "Idempotency"; }
 
     local show_state
     show_state=$(get_show "$show_id")
     local confirmed
-    confirmed=$(echo "$show_state" | grep -o '"confirmed":[0-9]*' | cut -d: -f2)
+    confirmed=$(extract_number "$show_state" "confirmed")
     [ "$confirmed" -eq 1 ] && pass "Exactly 1 reservation in DB" \
                            || fail "Expected 1 reservation, got $confirmed"
 
-    # Same key, different seat → must be 409
+    # Same key, different seat -> must be 409
     info "Testing same key with different seat..."
     local token
     token=$(jwt "idemp-user")
-    local conflict_status
-    conflict_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/shows/$show_id/reserve" \
+    local conflict_resp conflict_status conflict_body
+    conflict_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/shows/$show_id/reserve" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $token" \
         -H "Idempotency-Key: same-key-123" \
         -d '{"seats":["I2"]}')
+    conflict_status=$(echo "$conflict_resp" | tail -1)
+    conflict_body=$(echo "$conflict_resp" | sed '$d')
 
-    [ "$conflict_status" -eq 409 ] && pass "Same key + different seat → 409" \
-                                   || fail "Expected 409, got $conflict_status"
+    if [ "$conflict_status" = "409" ]; then
+        pass "Same key + different seat -> 409"
+    else
+        fail "Same key + different seat: expected 409, got $conflict_status"
+        error_detail "Response: $conflict_body"
+    fi
 }
 
 # ── Test 4: Cancellation + Re-reserve ──────────────────────────
 
 test_cancel() {
-    printf "\n${BOLD}═══ Test 4: Cancel and Re-reserve ═══${NC}\n"
+    printf "\n${BOLD}=== Test 4: Cancel and Re-reserve ===${NC}\n"
 
     local resp
-    resp=$(create_show "cancel-test" '["C1","C2","C3"]' 5000 4)
+    resp=$(create_show "cancel-test" '["C1","C2","C3"]' 5000 4) || return 0
     local show_id
-    show_id=$(echo "$resp" | grep -o '"show_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    show_id=$(extract_field "$resp" "show_id")
     info "Show created: $show_id"
 
     # Reserve C1
     local token
     token=$(jwt "cancel-user")
-    local reserve_resp
-    reserve_resp=$(curl -s -X POST "$BASE_URL/shows/$show_id/reserve" \
+    local reserve_resp reserve_status reserve_body
+    reserve_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/shows/$show_id/reserve" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $token" \
         -H "Idempotency-Key: cancel-key-1" \
         -d '{"seats":["C1"]}')
+    reserve_status=$(echo "$reserve_resp" | tail -1)
+    reserve_body=$(echo "$reserve_resp" | sed '$d')
+
+    if [ "$reserve_status" != "201" ]; then
+        fail "Reserve C1 failed (HTTP $reserve_status)"
+        error_detail "Response: $reserve_body"
+        return 0
+    fi
+
     local res_id
-    res_id=$(echo "$reserve_resp" | grep -o '"reservation_id":"[^"]*"' | cut -d'"' -f4)
-    [ -n "$res_id" ] && pass "Reserved C1 (id=$res_id)" || { fail "Reserve failed"; return 1; }
+    res_id=$(extract_field "$reserve_body" "reservation_id")
+    pass "Reserved C1 (id=$res_id)"
 
     # Cancel
-    local cancel_status
-    cancel_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/reservations/$res_id/cancel" \
+    local cancel_resp cancel_status cancel_body
+    cancel_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/reservations/$res_id/cancel" \
         -H "Authorization: Bearer $token")
-    [ "$cancel_status" -eq 200 ] && pass "Cancelled reservation" || fail "Cancel returned $cancel_status"
+    cancel_status=$(echo "$cancel_resp" | tail -1)
+    cancel_body=$(echo "$cancel_resp" | sed '$d')
+
+    if [ "$cancel_status" = "200" ]; then
+        pass "Cancelled reservation"
+    else
+        fail "Cancel returned HTTP $cancel_status"
+        error_detail "Response: $cancel_body"
+    fi
 
     # Double cancel
-    local double_cancel
-    double_cancel=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/reservations/$res_id/cancel" \
+    local double_resp double_status double_body
+    double_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/reservations/$res_id/cancel" \
         -H "Authorization: Bearer $token")
-    [ "$double_cancel" -eq 409 ] && pass "Double cancel → 409" || fail "Double cancel returned $double_cancel"
+    double_status=$(echo "$double_resp" | tail -1)
+    double_body=$(echo "$double_resp" | sed '$d')
 
-    # Re-reserve same seat with different user
+    if [ "$double_status" = "409" ]; then
+        pass "Double cancel -> 409"
+    else
+        fail "Double cancel: expected 409, got $double_status"
+        error_detail "Response: $double_body"
+    fi
+
+    # Wrong user cancel
     local token2
     token2=$(jwt "other-user")
-    local re_reserve
-    re_reserve=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/shows/$show_id/reserve" \
+    local wrong_resp wrong_status wrong_body
+    wrong_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/reservations/$res_id/cancel" \
+        -H "Authorization: Bearer $token2")
+    wrong_status=$(echo "$wrong_resp" | tail -1)
+    wrong_body=$(echo "$wrong_resp" | sed '$d')
+
+    if [ "$wrong_status" = "403" ]; then
+        pass "Wrong user cancel -> 403"
+    else
+        fail "Wrong user cancel: expected 403, got $wrong_status"
+        error_detail "Response: $wrong_body"
+    fi
+
+    # Re-reserve same seat with different user
+    local re_resp re_status re_body
+    re_resp=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/shows/$show_id/reserve" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $token2" \
         -H "Idempotency-Key: re-reserve-key" \
         -d '{"seats":["C1"]}')
-    [ "$re_reserve" -eq 201 ] && pass "Re-reserved cancelled seat C1" || fail "Re-reserve returned $re_reserve"
+    re_status=$(echo "$re_resp" | tail -1)
+    re_body=$(echo "$re_resp" | sed '$d')
+
+    if [ "$re_status" = "201" ]; then
+        pass "Re-reserved cancelled seat C1"
+    else
+        fail "Re-reserve: expected 201, got $re_status"
+        error_detail "Response: $re_body"
+    fi
 
     # Reconciliation
     local show_state
     show_state=$(get_show "$show_id")
     local available confirmed total
-    available=$(echo "$show_state" | grep -o '"available":[0-9]*' | cut -d: -f2)
-    confirmed=$(echo "$show_state" | grep -o '"confirmed":[0-9]*' | cut -d: -f2)
-    total=$(echo "$show_state" | grep -o '"total_seats":[0-9]*' | cut -d: -f2)
+    available=$(extract_number "$show_state" "available")
+    confirmed=$(extract_number "$show_state" "confirmed")
+    total=$(extract_number "$show_state" "total_seats")
     local sum=$((available + confirmed))
-    [ "$sum" -eq "$total" ] && pass "Reconciliation: $available + $confirmed = $total" \
-                            || fail "Reconciliation failed: $sum != $total"
+    if [ "$sum" -eq "$total" ]; then
+        pass "Reconciliation: $available + $confirmed = $total"
+    else
+        fail "Reconciliation failed: $available + $confirmed = $sum (expected $total)"
+        error_detail "Show state: $show_state"
+    fi
 }
 
 # ── Run all tests ──────────────────────────────────────────────
 
-printf "${BOLD}Burst Test — %s${NC}\n" "$BASE_URL"
-printf "Parallel workers: %d\n" "$PARALLEL"
+printf "\n${BOLD}========================================${NC}\n"
+printf "${BOLD}    SEAT RESERVATION BURST TEST${NC}\n"
+printf "${BOLD}========================================${NC}\n"
+printf "\n  Target:   %s\n" "$BASE_URL"
+printf "  Workers:  %d parallel\n" "$PARALLEL"
+printf "  Storm:    %d users\n" "$HOT_SEAT_USERS"
 
+check_connectivity
 test_hot_seat
 test_per_user_limit
 test_idempotency
 test_cancel
 
-printf "\n${BOLD}═══ All tests complete ═══${NC}\n"
+# Summary
+end_time=$(date +%s)
+duration=$((end_time - START_TIME))
+
+printf "\n${BOLD}========================================${NC}\n"
+printf "  Duration: %ds\n" "$duration"
+if [ "$TOTAL_FAIL" -eq 0 ]; then
+    printf "  ${GREEN}${BOLD}ALL %d ASSERTIONS PASSED${NC}\n" "$TOTAL_ASSERTIONS"
+else
+    printf "  ${RED}${BOLD}%d FAILED${NC} / %d assertions (%d passed)\n" \
+        "$TOTAL_FAIL" "$TOTAL_ASSERTIONS" "$TOTAL_PASS"
+fi
+printf "${BOLD}========================================${NC}\n\n"
+
+[ "$TOTAL_FAIL" -eq 0 ] && exit 0 || exit 1

@@ -19,6 +19,11 @@ services:
     build: .
     ports:
       - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2g
     environment:
       PGHOST: db
       PGPORT: 5432
