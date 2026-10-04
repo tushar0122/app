@@ -63,6 +63,16 @@ public class ReservationService {
                 .findByShowIdAndUserIdForUpdate(showId, userId)
                 .orElseThrow(() -> new IllegalStateException("show_user row was not created"));
 
+        // 5. Re-check idempotency after serialization.
+        //    Under READ COMMITTED, this now sees any reservation committed
+        //    by a concurrent request that held this lock before us.
+        existing = reservationRepository
+                .findByUserIdAndIdempotencyKey(userId, idempotencyKey);
+        if (existing.isPresent()) {
+            return handleIdempotency(existing.get(), requestHash);
+        }
+
+        // 6. Per-user limit check
         int currentCount = showUser.getReservedCount();
         if (currentCount + sortedSeats.size() > show.getPerUserLimit()) {
             log.info("Per-user limit exceeded user={} show={} current={} requested={}",
@@ -70,7 +80,7 @@ public class ReservationService {
             throw new PerUserLimitException("Per-user limit of " + show.getPerUserLimit() + " exceeded");
         }
 
-        // 5. Lock seat rows in deterministic order and check availability
+        // 7. Lock seat rows in deterministic order and check availability
         List<Seat> seats = seatRepository.findByShowIdAndSeatNumbersForUpdate(showId, sortedSeats);
 
         if (seats.size() != sortedSeats.size()) {
@@ -84,9 +94,7 @@ public class ReservationService {
             }
         }
 
-        // 6. All checks passed — insert reservation.
-        //    ON CONFLICT DO NOTHING on (user_id, idempotency_key):
-        //    returns 1 if inserted, 0 if key already exists.
+        // 8. All checks passed — insert reservation
         UUID reservationId = UUID.randomUUID();
         long amountPaise = show.getPricePaise() * sortedSeats.size();
 
@@ -100,7 +108,7 @@ public class ReservationService {
             return handleIdempotency(winner, requestHash);
         }
 
-        // 7. Create reservation_seats and update seat status
+        // 9. Create reservation_seats and update seat status
         for (Seat seat : seats) {
             ReservationSeat rs = new ReservationSeat();
             rs.setReservationId(reservationId);
@@ -111,7 +119,7 @@ public class ReservationService {
             seatRepository.save(seat);
         }
 
-        // 8. Update show_user counter
+        // 10. Update show_user counter
         showUser.setReservedCount(showUser.getReservedCount() + sortedSeats.size());
         showUserRepository.save(showUser);
 
