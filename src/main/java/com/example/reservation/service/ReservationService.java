@@ -3,7 +3,11 @@ package com.example.reservation.service;
 import com.example.reservation.dto.ReservationResponse;
 import com.example.reservation.dto.ReserveRequest;
 import com.example.reservation.entity.*;
-import com.example.reservation.exception.*;
+import com.example.reservation.exception.IdempotencyConflictException;
+import com.example.reservation.exception.InvalidSeatException;
+import com.example.reservation.exception.PerUserLimitException;
+import com.example.reservation.exception.SeatTakenException;
+import com.example.reservation.exception.ShowNotFoundException;
 import com.example.reservation.repository.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,7 +79,7 @@ public class ReservationService {
         List<Seat> seats = seatRepository.findByShowIdAndSeatNumbersForUpdate(showId, sortedSeats);
 
         if (seats.size() != sortedSeats.size()) {
-            throw new SeatTakenException("One or more requested seats do not exist");
+            throw new InvalidSeatException("One or more requested seats do not exist in this show");
         }
 
         for (Seat seat : seats) {

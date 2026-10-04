@@ -35,6 +35,12 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse("IDEMPOTENCY_KEY_REUSED", ex.getMessage(), MDC.get("requestId")));
     }
 
+    @ExceptionHandler(InvalidSeatException.class)
+    public ResponseEntity<ErrorResponse> handleInvalidSeat(InvalidSeatException ex) {
+        return ResponseEntity.badRequest()
+                .body(new ErrorResponse("INVALID_SEAT", ex.getMessage(), MDC.get("requestId")));
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
         return ResponseEntity.badRequest()
