@@ -6,6 +6,7 @@ import com.example.reservation.service.ReservationService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.UUID;
@@ -22,10 +23,11 @@ public class ReservationController {
     @PostMapping("/shows/{showId}/reserve")
     public ResponseEntity<ReservationResponse> reserve(
             @PathVariable UUID showId,
-            @RequestHeader("X-User-ID") String userId,
             @RequestHeader("Idempotency-Key") String idempotencyKey,
-            @Valid @RequestBody ReserveRequest request) {
+            @Valid @RequestBody ReserveRequest request,
+            Authentication authentication) {
 
+        String userId = authentication.getName();
         ReservationResponse response = reservationService.reserve(showId, userId, idempotencyKey, request);
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
@@ -33,8 +35,9 @@ public class ReservationController {
     @PostMapping("/reservations/{reservationId}/cancel")
     public ResponseEntity<ReservationResponse> cancel(
             @PathVariable UUID reservationId,
-            @RequestHeader("X-User-ID") String userId) {
+            Authentication authentication) {
 
+        String userId = authentication.getName();
         ReservationResponse response = reservationService.cancel(reservationId, userId);
         return ResponseEntity.ok(response);
     }
