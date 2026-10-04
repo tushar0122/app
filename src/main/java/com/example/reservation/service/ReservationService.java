@@ -5,6 +5,8 @@ import com.example.reservation.dto.ReserveRequest;
 import com.example.reservation.entity.*;
 import com.example.reservation.exception.*;
 import com.example.reservation.repository.*;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -26,16 +28,32 @@ public class ReservationService {
     private final ReservationSeatRepository reservationSeatRepository;
     private final ShowUserRepository showUserRepository;
 
+    private final Counter confirmedCounter;
+    private final Counter cancelledCounter;
+    private final Counter seatTakenCounter;
+    private final Counter perUserLimitCounter;
+    private final Counter idempotentReplayCounter;
+
     public ReservationService(ShowRepository showRepository,
                               SeatRepository seatRepository,
                               ReservationRepository reservationRepository,
                               ReservationSeatRepository reservationSeatRepository,
-                              ShowUserRepository showUserRepository) {
+                              ShowUserRepository showUserRepository,
+                              MeterRegistry registry) {
         this.showRepository = showRepository;
         this.seatRepository = seatRepository;
         this.reservationRepository = reservationRepository;
         this.reservationSeatRepository = reservationSeatRepository;
         this.showUserRepository = showUserRepository;
+
+        this.confirmedCounter = Counter.builder("reservations_confirmed_total").register(registry);
+        this.cancelledCounter = Counter.builder("reservations_cancelled_total").register(registry);
+        this.seatTakenCounter = Counter.builder("reservations_declined_total")
+                .tag("reason", "seat_taken").register(registry);
+        this.perUserLimitCounter = Counter.builder("reservations_declined_total")
+                .tag("reason", "per_user_limit").register(registry);
+        this.idempotentReplayCounter = Counter.builder("reservations_declined_total")
+                .tag("reason", "idempotent_replay").register(registry);
     }
 
     @Transactional
@@ -48,6 +66,7 @@ public class ReservationService {
         Optional<Reservation> existing = reservationRepository
                 .findByShowIdAndUserIdAndIdempotencyKey(showId, userId, idempotencyKey);
         if (existing.isPresent()) {
+            idempotentReplayCounter.increment();
             return handleIdempotency(existing.get(), requestHash);
         }
 
@@ -69,6 +88,7 @@ public class ReservationService {
         existing = reservationRepository
                 .findByShowIdAndUserIdAndIdempotencyKey(showId, userId, idempotencyKey);
         if (existing.isPresent()) {
+            idempotentReplayCounter.increment();
             return handleIdempotency(existing.get(), requestHash);
         }
 
@@ -77,6 +97,7 @@ public class ReservationService {
         if (currentCount + sortedSeats.size() > show.getPerUserLimit()) {
             log.info("Per-user limit exceeded user={} show={} current={} requested={}",
                     userId, showId, currentCount, sortedSeats.size());
+            perUserLimitCounter.increment();
             throw new PerUserLimitException("Per-user limit of " + show.getPerUserLimit() + " exceeded");
         }
 
@@ -90,6 +111,7 @@ public class ReservationService {
         for (Seat seat : seats) {
             if (!"AVAILABLE".equals(seat.getStatus())) {
                 log.info("Seat taken seat={} show={} user={}", seat.getSeatNumber(), showId, userId);
+                seatTakenCounter.increment();
                 throw new SeatTakenException("One or more requested seats are already reserved");
             }
         }
@@ -123,6 +145,7 @@ public class ReservationService {
         showUser.setReservedCount(showUser.getReservedCount() + sortedSeats.size());
         showUserRepository.save(showUser);
 
+        confirmedCounter.increment();
         log.info("Reservation confirmed id={} show={} user={} seats={}",
                 reservationId, showId, userId, sortedSeats);
 
@@ -169,6 +192,7 @@ public class ReservationService {
         showUser.setReservedCount(showUser.getReservedCount() - seats.size());
         showUserRepository.save(showUser);
 
+        cancelledCounter.increment();
         List<String> seatNumbers = seats.stream().map(Seat::getSeatNumber).sorted().toList();
         log.info("Reservation cancelled id={} user={} seats={}", reservationId, userId, seatNumbers);
 
