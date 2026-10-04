@@ -56,19 +56,22 @@ public class ReservationService {
         Show show = showRepository.findById(showId)
                 .orElseThrow(() -> new ShowNotFoundException(showId));
 
-        // 3. Lock show_user row and check per-user limit
+        // 3. Ensure show_user row exists (ON CONFLICT DO NOTHING makes concurrent first-timers safe)
+        showUserRepository.createIfAbsent(showId, userId);
+
+        // 4. Lock show_user row
         ShowUser showUser = showUserRepository
                 .findByShowIdAndUserIdForUpdate(showId, userId)
-                .orElse(null);
+                .orElseThrow(() -> new IllegalStateException("show_user row was not created"));
 
-        int currentCount = showUser != null ? showUser.getReservedCount() : 0;
+        int currentCount = showUser.getReservedCount();
         if (currentCount + sortedSeats.size() > show.getPerUserLimit()) {
             log.info("Per-user limit exceeded user={} show={} current={} requested={}",
                     userId, showId, currentCount, sortedSeats.size());
             throw new PerUserLimitException("Per-user limit of " + show.getPerUserLimit() + " exceeded");
         }
 
-        // 4. Lock seat rows in deterministic order and check availability
+        // 5. Lock seat rows in deterministic order and check availability
         List<Seat> seats = seatRepository.findByShowIdAndSeatNumbersForUpdate(showId, sortedSeats);
 
         if (seats.size() != sortedSeats.size()) {
@@ -82,7 +85,7 @@ public class ReservationService {
             }
         }
 
-        // 5. Create reservation
+        // 6. Create reservation
         Reservation reservation = new Reservation();
         reservation.setShowId(showId);
         reservation.setUserId(userId);
@@ -101,7 +104,7 @@ public class ReservationService {
             return handleIdempotency(winner, requestHash);
         }
 
-        // 6. Create reservation_seats and update seat status
+        // 7. Create reservation_seats and update seat status
         for (Seat seat : seats) {
             ReservationSeat rs = new ReservationSeat();
             rs.setReservationId(reservation.getId());
@@ -112,15 +115,8 @@ public class ReservationService {
             seatRepository.save(seat);
         }
 
-        // 7. Update show_user counter
-        if (showUser == null) {
-            showUser = new ShowUser();
-            showUser.setShowId(showId);
-            showUser.setUserId(userId);
-            showUser.setReservedCount(sortedSeats.size());
-        } else {
-            showUser.setReservedCount(showUser.getReservedCount() + sortedSeats.size());
-        }
+        // 8. Update show_user counter
+        showUser.setReservedCount(showUser.getReservedCount() + sortedSeats.size());
         showUserRepository.save(showUser);
 
         log.info("Reservation confirmed id={} show={} user={} seats={}",
