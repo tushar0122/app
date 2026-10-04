@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: reservation
+      POSTGRES_USER: reservation
+      POSTGRES_PASSWORD: reservation
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reservation"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: reservation
+      DB_USER: reservation
+      DB_PASSWORD: reservation
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
