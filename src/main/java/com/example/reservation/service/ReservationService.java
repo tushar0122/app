@@ -124,16 +124,23 @@ public class ReservationService {
 
     @Transactional
     public ReservationResponse cancel(UUID reservationId, String userId) {
-        // 1. Lock reservation row
-        Reservation reservation = reservationRepository.findByIdForUpdate(reservationId)
+        // 1. Read reservation (no lock yet — just to get show_id and verify existence/ownership)
+        Reservation reservation = reservationRepository.findById(reservationId)
                 .orElseThrow(() -> new ReservationNotFoundException(reservationId));
 
-        // 2. Verify ownership
         if (!reservation.getUserId().equals(userId)) {
             throw new NotReservationOwnerException();
         }
 
-        // 3. Verify still cancellable
+        // 2. Lock show_user first — same order as reserve flow to prevent deadlocks
+        ShowUser showUser = showUserRepository
+                .findByShowIdAndUserIdForUpdate(reservation.getShowId(), userId)
+                .orElseThrow(() -> new IllegalStateException("show_user row not found"));
+
+        // 3. Lock reservation row
+        reservation = reservationRepository.findByIdForUpdate(reservationId)
+                .orElseThrow(() -> new ReservationNotFoundException(reservationId));
+
         if ("CANCELLED".equals(reservation.getStatus())) {
             throw new AlreadyCancelledException(reservationId);
         }
@@ -151,9 +158,6 @@ public class ReservationService {
         reservationRepository.save(reservation);
 
         // 6. Decrement show_user counter
-        ShowUser showUser = showUserRepository
-                .findByShowIdAndUserIdForUpdate(reservation.getShowId(), userId)
-                .orElseThrow(() -> new IllegalStateException("show_user row not found"));
         showUser.setReservedCount(showUser.getReservedCount() - seats.size());
         showUserRepository.save(showUser);
 
