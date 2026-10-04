@@ -135,7 +135,7 @@ public class ReservationService {
 
         // 3. Verify still cancellable
         if ("CANCELLED".equals(reservation.getStatus())) {
-            throw new SeatTakenException("Reservation is already cancelled");
+            throw new AlreadyCancelledException(reservationId);
         }
 
         // 4. Lock associated seats and set to AVAILABLE

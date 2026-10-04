@@ -35,6 +35,12 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse("IDEMPOTENCY_KEY_REUSED", ex.getMessage(), MDC.get("requestId")));
     }
 
+    @ExceptionHandler(AlreadyCancelledException.class)
+    public ResponseEntity<ErrorResponse> handleAlreadyCancelled(AlreadyCancelledException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ErrorResponse("ALREADY_CANCELLED", ex.getMessage(), MDC.get("requestId")));
+    }
+
     @ExceptionHandler(ReservationNotFoundException.class)
     public ResponseEntity<ErrorResponse> handleReservationNotFound(ReservationNotFoundException ex) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
