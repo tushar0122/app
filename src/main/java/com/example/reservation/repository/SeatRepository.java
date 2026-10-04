@@ -21,5 +21,10 @@ public interface SeatRepository extends JpaRepository<Seat, Long> {
     List<Seat> findByShowIdAndSeatNumbersForUpdate(@Param("showId") UUID showId,
                                                     @Param("seatNumbers") List<String> seatNumbers);
 
+    @Query(value = "SELECT s.* FROM seats s JOIN reservation_seats rs ON s.id = rs.seat_id " +
+                   "WHERE rs.reservation_id = :reservationId ORDER BY s.seat_number FOR UPDATE",
+           nativeQuery = true)
+    List<Seat> findByReservationIdForUpdate(@Param("reservationId") UUID reservationId);
+
     long countByShowIdAndStatus(UUID showId, String status);
 }

@@ -35,6 +35,18 @@ public class GlobalExceptionHandler {
                 .body(new ErrorResponse("IDEMPOTENCY_KEY_REUSED", ex.getMessage(), MDC.get("requestId")));
     }
 
+    @ExceptionHandler(ReservationNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleReservationNotFound(ReservationNotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(new ErrorResponse("RESERVATION_NOT_FOUND", ex.getMessage(), MDC.get("requestId")));
+    }
+
+    @ExceptionHandler(NotReservationOwnerException.class)
+    public ResponseEntity<ErrorResponse> handleNotOwner(NotReservationOwnerException ex) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(new ErrorResponse("NOT_RESERVATION_OWNER", ex.getMessage(), MDC.get("requestId")));
+    }
+
     @ExceptionHandler(InvalidSeatException.class)
     public ResponseEntity<ErrorResponse> handleInvalidSeat(InvalidSeatException ex) {
         return ResponseEntity.badRequest()

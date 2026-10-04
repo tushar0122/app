@@ -3,11 +3,7 @@ package com.example.reservation.service;
 import com.example.reservation.dto.ReservationResponse;
 import com.example.reservation.dto.ReserveRequest;
 import com.example.reservation.entity.*;
-import com.example.reservation.exception.IdempotencyConflictException;
-import com.example.reservation.exception.InvalidSeatException;
-import com.example.reservation.exception.PerUserLimitException;
-import com.example.reservation.exception.SeatTakenException;
-import com.example.reservation.exception.ShowNotFoundException;
+import com.example.reservation.exception.*;
 import com.example.reservation.repository.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -124,6 +120,47 @@ public class ReservationService {
 
         return new ReservationResponse(
                 reservationId, showId, userId, sortedSeats, amountPaise, "CONFIRMED");
+    }
+
+    @Transactional
+    public ReservationResponse cancel(UUID reservationId, String userId) {
+        // 1. Lock reservation row
+        Reservation reservation = reservationRepository.findByIdForUpdate(reservationId)
+                .orElseThrow(() -> new ReservationNotFoundException(reservationId));
+
+        // 2. Verify ownership
+        if (!reservation.getUserId().equals(userId)) {
+            throw new NotReservationOwnerException();
+        }
+
+        // 3. Verify still cancellable
+        if ("CANCELLED".equals(reservation.getStatus())) {
+            throw new SeatTakenException("Reservation is already cancelled");
+        }
+
+        // 4. Lock associated seats and set to AVAILABLE
+        List<Seat> seats = seatRepository.findByReservationIdForUpdate(reservationId);
+        for (Seat seat : seats) {
+            seat.setStatus("AVAILABLE");
+            seatRepository.save(seat);
+        }
+
+        // 5. Update reservation status
+        reservation.setStatus("CANCELLED");
+        reservation.setCancelledAt(java.time.Instant.now());
+        reservationRepository.save(reservation);
+
+        // 6. Decrement show_user counter
+        ShowUser showUser = showUserRepository
+                .findByShowIdAndUserIdForUpdate(reservation.getShowId(), userId)
+                .orElseThrow(() -> new IllegalStateException("show_user row not found"));
+        showUser.setReservedCount(showUser.getReservedCount() - seats.size());
+        showUserRepository.save(showUser);
+
+        List<String> seatNumbers = seats.stream().map(Seat::getSeatNumber).sorted().toList();
+        log.info("Reservation cancelled id={} user={} seats={}", reservationId, userId, seatNumbers);
+
+        return toResponse(reservation, seatNumbers);
     }
 
     private ReservationResponse handleIdempotency(Reservation existing, String requestHash) {

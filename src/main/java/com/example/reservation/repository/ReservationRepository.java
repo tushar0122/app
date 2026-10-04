@@ -13,6 +13,9 @@ public interface ReservationRepository extends JpaRepository<Reservation, UUID> 
 
     Optional<Reservation> findByUserIdAndIdempotencyKey(String userId, String idempotencyKey);
 
+    @Query(value = "SELECT * FROM reservations WHERE id = :id FOR UPDATE", nativeQuery = true)
+    Optional<Reservation> findByIdForUpdate(@Param("id") UUID id);
+
     @Modifying
     @Query(value = "INSERT INTO reservations (id, show_id, user_id, amount_paise, status, idempotency_key, request_hash, created_at) " +
                    "VALUES (:id, :showId, :userId, :amountPaise, 'CONFIRMED', :idempotencyKey, :requestHash, now()) " +

@@ -29,4 +29,13 @@ public class ReservationController {
         ReservationResponse response = reservationService.reserve(showId, userId, idempotencyKey, request);
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
+
+    @PostMapping("/reservations/{reservationId}/cancel")
+    public ResponseEntity<ReservationResponse> cancel(
+            @PathVariable UUID reservationId,
+            @RequestHeader("X-User-ID") String userId) {
+
+        ReservationResponse response = reservationService.cancel(reservationId, userId);
+        return ResponseEntity.ok(response);
+    }
 }
